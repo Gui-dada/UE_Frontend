@@ -323,3 +323,167 @@ def end_play(timeout_sec=0):
         "ended": None,
         "note": "PIE 停止是异步的，请 2-3 秒后调用 pie_status 检查 in_pie",
     }
+
+
+
+def run_sequence(steps, world=None):
+    """PIE 已启动后执行测试序列。
+
+    steps 是列表，每项是一个 dict，支持的类型：
+
+      {"type": "sleep", "sec": 1.5}
+      {"type": "console", "cmd": "Stat FPS"}
+      {"type": "spawn", "class_path": "/Script/Engine.TargetPoint"}
+      {"type": "spawn", "class_path": "/Game/Blueprints/BP_Enemy.BP_Enemy_C"}
+      {"type": "assert_actor_count", "min": 40}           # 或 expected / max
+      {"type": "assert_actor_exists", "name_contains": "Enemy"}
+      {"type": "assert_no_new_errors"}                    # 检查日志增量是否有新 Error
+
+    返回：
+      {
+        "ok": bool,                    # 所有 step 是否通过
+        "steps": [{index, type, ok, ...}],
+        "final_actor_count": int,
+        "final_actor_names": [str],
+        "errors": [str],
+      }
+    """
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+
+    if not les.is_in_play_in_editor():
+        return {"ok": False, "error": "PIE 未运行，先调用 begin_play 并等待 5-6 秒"}
+
+    if world is None:
+        world = ues.get_game_world()
+    if world is None:
+        return {"ok": False, "error": "PIE World 不可用（get_game_world 返回 None）"}
+
+    def _actor_count():
+        return len(unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor))
+
+    def _actor_names(limit=None):
+        actors = unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor)
+        names = [str(a.get_name()) for a in actors]
+        return names[:limit] if limit else names
+
+    results = []
+    errors = []
+    ok_all = True
+
+    for idx, step in enumerate(steps):
+        stype = step.get("type", "")
+        step_result = {"index": idx, "type": stype, "ok": True}
+
+        try:
+            if stype == "sleep":
+                sec = max(0.0, float(step.get("sec", 1.0)))
+                time.sleep(sec)
+                step_result["detail"] = f"slept {sec}s"
+
+            elif stype == "console":
+                cmd = str(step["cmd"])
+                unreal.SystemLibrary.execute_console_command(world, cmd)
+                step_result["detail"] = f"sent: {cmd}"
+
+            elif stype == "spawn":
+                class_path = str(step["class_path"])
+                # Summon 是 UE 的 spawn 命令；类路径格式：
+                #   引擎类：/Script/Engine.TargetPoint
+                #   蓝图类：/Game/Path/BP_X.BP_X_C
+                cmd = "Summon " + class_path
+                before_n = _actor_count()
+                unreal.SystemLibrary.execute_console_command(world, cmd)
+                time.sleep(0.5)  # Summon 是异步的，等 spawn 生效
+                after_n = _actor_count()
+                step_result["detail"] = (
+                    f"Summon {class_path}: count {before_n} -> {after_n}"
+                )
+                # 不强制 delta > 0（有些 Summon 可能因位置/条件失败，让后续 assert 判断）
+
+            elif stype == "assert_actor_count":
+                n = _actor_count()
+                checks = []
+                ok = True
+                if "expected" in step:
+                    checks.append(("expected", step["expected"]))
+                    ok = ok and n == step["expected"]
+                if "min" in step:
+                    checks.append(("min", step["min"]))
+                    ok = ok and n >= step["min"]
+                if "max" in step:
+                    checks.append(("max", step["max"]))
+                    ok = ok and n <= step["max"]
+                step_result["actual"] = n
+                step_result["expected"] = dict(checks)
+                step_result["ok"] = ok
+                if not ok:
+                    errors.append(
+                        f"step {idx} assert_actor_count: expected {dict(checks)}, got {n}"
+                    )
+                    ok_all = False
+
+            elif stype == "assert_actor_exists":
+                substr = str(step["name_contains"])
+                names = _actor_names()
+                found = any(substr in n for n in names)
+                step_result["found"] = found
+                step_result["ok"] = found
+                step_result["sample"] = names[:10]
+                if not found:
+                    errors.append(
+                        f"step {idx} assert_actor_exists: no actor name contains '{substr}' "
+                        f"(sample: {names[:5]})"
+                    )
+                    ok_all = False
+
+            elif stype == "assert_no_new_errors":
+                # 用 begin_play 记录的 baseline 比较；这里通过 agent_pie 的 helper 读取
+                baseline = step.get("baseline_size")
+                log_path = step.get("log_path")
+                if baseline is None:
+                    step_result["ok"] = False
+                    step_result["error"] = "baseline_size 未提供"
+                    errors.append(f"step {idx} assert_no_new_errors: baseline_size missing")
+                    ok_all = False
+                else:
+                    delta = _read_log_delta(baseline, path=log_path)
+                    errs = []
+                    for line in delta.get("text", "").splitlines():
+                        cls = _classify_line(line)
+                        if cls and cls[0] == "error":
+                            errs.append({"category": cls[1], "message": cls[2]})
+                    step_result["error_count"] = len(errs)
+                    step_result["errors_sample"] = errs[:5]
+                    step_result["ok"] = (len(errs) == 0)
+                    if errs:
+                        errors.append(
+                            f"step {idx} assert_no_new_errors: {len(errs)} new error(s) in log"
+                        )
+                        ok_all = False
+
+            else:
+                step_result["ok"] = False
+                step_result["error"] = f"unknown step type: {stype}"
+                ok_all = False
+                errors.append(f"step {idx}: unknown type '{stype}'")
+
+        except Exception as exc:
+            step_result["ok"] = False
+            step_result["error"] = f"{type(exc).__name__}: {exc}"
+            errors.append(f"step {idx} ({stype}) raised: {type(exc).__name__}: {exc}")
+            ok_all = False
+
+        results.append(step_result)
+
+        # 一旦失败就停（避免后续断言依赖失败的前置操作）
+        if not step_result["ok"]:
+            break
+
+    return {
+        "ok": ok_all,
+        "steps": results,
+        "final_actor_count": _actor_count(),
+        "final_actor_names": _actor_names(limit=20),
+        "errors": errors,
+    }
