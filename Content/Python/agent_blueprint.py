@@ -265,3 +265,171 @@ def reparent_blueprint(bp_path, new_parent_class):
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         return result
+
+
+
+
+def _resolve_component_class(input_obj):
+    """把组件类输入解析成 unreal.Class。
+
+    支持：
+      - "PointLightComponent"（短名）
+      - "/Script/Engine.PointLightComponent"（完整路径）
+      - unreal.PointLightComponent（Python 类对象）
+    """
+    if isinstance(input_obj, unreal.Class):
+        return input_obj
+    if isinstance(input_obj, str):
+        path = input_obj if input_obj.startswith("/") else f"/Script/Engine.{input_obj}"
+        cls = unreal.load_class(None, path)
+        if cls is None:
+            raise ValueError(f"无法加载组件类：{path}")
+        return cls
+    if hasattr(input_obj, "static_class"):
+        return input_obj.static_class()
+    raise TypeError(f"不支持的组件类输入：{type(input_obj).__name__}")
+
+
+def add_component(bp_path, component_class_input, parent_component_name=None):
+    """给蓝图添加组件（挂在根组件或指定父组件下）。
+
+    返回：
+      {
+        "ok": bool,
+        "path": str,
+        "component_class": str | None,       # 如 "PointLightComponent"
+        "parent_handle_used": str | None,
+        "error": str | None,
+      }
+    """
+    result = {
+        "ok": False,
+        "path": bp_path,
+        "component_class": None,
+        "parent_handle_used": None,
+        "error": None,
+    }
+
+    try:
+        bp = _load_blueprint(bp_path)
+        if not bp:
+            result["error"] = f"蓝图不存在：{bp_path}"
+            return result
+
+        try:
+            comp_cls = _resolve_component_class(component_class_input)
+            result["component_class"] = str(comp_cls.get_name())
+        except Exception as e:
+            result["error"] = f"组件类解析失败：{type(e).__name__}: {e}"
+            return result
+
+        subsys = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        if not subsys:
+            result["error"] = "SubobjectDataSubsystem 不可用"
+            return result
+
+        handles = subsys.k2_gather_subobject_data_for_blueprint(bp)
+        if not handles:
+            result["error"] = "蓝图无子对象（可能未编译）"
+            return result
+
+        # 父 handle：默认根（handles[0]）
+        parent_handle = handles[0]
+        if parent_component_name:
+            for h in handles:
+                try:
+                    data = subsys.get_data_from_handle(h)
+                    for getter in ("get_display_name", "get_variable_name"):
+                        fn = getattr(data, getter, None)
+                        if callable(fn):
+                            name = str(fn())
+                            if parent_component_name in name:
+                                parent_handle = h
+                                break
+                except Exception:
+                    pass
+        result["parent_handle_used"] = str(parent_handle)
+
+        # 加组件
+        params = unreal.AddNewSubobjectParams(
+            parent_handle=parent_handle,
+            new_class=comp_cls,
+            blueprint_context=bp,
+        )
+        handle, fail_reason = subsys.add_new_subobject(params)
+        if handle is None:
+            result["error"] = f"add_new_subobject 失败：{fail_reason}"
+            return result
+
+        # 保存
+        try:
+            unreal.EditorAssetLibrary.save_loaded_asset(bp, only_if_is_dirty=False)
+        except Exception as e:
+            result["error"] = f"已添加但保存失败：{type(e).__name__}: {e}"
+            return result
+
+        result["ok"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+def list_components(bp_path):
+    """列出蓝图子对象。
+
+    UE 5.7 限制：SubobjectData 是空 struct，读不到组件名/类。
+    只能返回 handle 数量。判断"加组件是否成功"靠前后 count 对比。
+    """
+    result = {"ok": False, "path": bp_path, "count": 0, "error": None}
+    try:
+        bp = _load_blueprint(bp_path)
+        if not bp:
+            result["error"] = f"蓝图不存在：{bp_path}"
+            return result
+        subsys = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        if not subsys:
+            result["error"] = "SubobjectDataSubsystem 不可用"
+            return result
+        handles = subsys.k2_gather_subobject_data_for_blueprint(bp) or []
+        result["count"] = len(handles)
+        result["ok"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+    """列出蓝图所有子对象（尽力而为，字段可能读不到）。"""
+    result = {"ok": False, "path": bp_path, "count": 0, "components": [], "error": None}
+    try:
+        bp = _load_blueprint(bp_path)
+        if not bp:
+            result["error"] = f"蓝图不存在：{bp_path}"
+            return result
+        subsys = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        handles = subsys.k2_gather_subobject_data_for_blueprint(bp) or []
+        result["count"] = len(handles)
+
+        for i, h in enumerate(handles):
+            entry = {"index": i}
+            try:
+                data = subsys.get_data_from_handle(h)
+                for getter in (
+                    "get_display_name", "get_variable_name",
+                    "get_object_display_name", "get_class_display_name",
+                    "get_editor_property",
+                ):
+                    fn = getattr(data, getter, None)
+                    if callable(fn):
+                        try:
+                            entry[getter] = str(fn())
+                        except Exception:
+                            pass
+            except Exception as e:
+                entry["err"] = f"{type(e).__name__}: {e}"
+            result["components"].append(entry)
+
+        result["ok"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
