@@ -433,3 +433,207 @@ def list_components(bp_path):
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         return result
+
+
+def create_blueprint(bp_path, parent_class_input):
+    """创建蓝图资产。
+
+    返回：
+      {
+        "ok": bool,
+        "path": str,
+        "parent_class": str | None,
+        "created": bool,     # True = 新创建；False = 已存在
+        "error": str | None,
+      }
+    """
+    result = {
+        "ok": False,
+        "path": bp_path,
+        "parent_class": None,
+        "created": False,
+        "error": None,
+    }
+
+    try:
+        if unreal.EditorAssetLibrary.does_asset_exist(bp_path):
+            info = get_blueprint_info(bp_path)
+            result["ok"] = True
+            result["parent_class"] = info.get("parent_class")
+            return result
+
+        parent_cls = _resolve_parent_class(parent_class_input)
+        result["parent_class"] = str(parent_cls.get_name())
+
+        bp = unreal.BlueprintEditorLibrary.create_blueprint_asset_with_parent(
+            bp_path, parent_cls
+        )
+        if bp is None:
+            result["error"] = f"create_blueprint_asset_with_parent 返回 None"
+            return result
+
+        unreal.EditorAssetLibrary.save_loaded_asset(bp, only_if_is_dirty=False)
+        result["ok"] = True
+        result["created"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+
+
+def create_blueprint(bp_path, parent_class_input):
+    """创建蓝图资产。
+
+    返回：
+      {
+        "ok": bool,
+        "path": str,
+        "parent_class": str | None,
+        "created": bool,      # True = 新建；False = 已存在
+        "error": str | None,
+      }
+    """
+    result = {
+        "ok": False,
+        "path": bp_path,
+        "parent_class": None,
+        "created": False,
+        "error": None,
+    }
+
+    try:
+        # 已存在就直接返回 info
+        if unreal.EditorAssetLibrary.does_asset_exist(bp_path):
+            info = get_blueprint_info(bp_path)
+            result["ok"] = True
+            result["parent_class"] = info.get("parent_class")
+            return result
+
+        parent_cls = _resolve_parent_class(parent_class_input)
+        result["parent_class"] = str(parent_cls.get_name())
+
+        bp = unreal.BlueprintEditorLibrary.create_blueprint_asset_with_parent(
+            bp_path, parent_cls
+        )
+        if bp is None:
+            result["error"] = "create_blueprint_asset_with_parent 返回 None"
+            return result
+
+        unreal.EditorAssetLibrary.save_loaded_asset(bp, only_if_is_dirty=False)
+        result["ok"] = True
+        result["created"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+
+
+def delete_component(bp_path, index=-1):
+    """删除蓝图组件（按 handle 索引）。index=-1 删最后一个。"""
+    result = {"ok": False, "path": bp_path, "deleted_index": None,
+              "deleted_count": 0,
+              "count_before": 0, "count_after": 0, "error": None}
+    try:
+        bp = _load_blueprint(bp_path)
+        if not bp:
+            result["error"] = f"蓝图不存在：{bp_path}"
+            return result
+        subsys = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        handles = subsys.k2_gather_subobject_data_for_blueprint(bp) or []
+        result["count_before"] = len(handles)
+        if len(handles) <= 1:
+            result["error"] = "只有根组件，无可删组件"
+            return result
+        if index < 0:
+            index = len(handles) - 1
+        if index == 0 or index >= len(handles):
+            result["error"] = f"index 无效：{index}（共 {len(handles)} 个）"
+            return result
+        handle = handles[index]
+        # UE 5.7 正确签名：(context_handle, subobject_to_delete, bp_context)
+        context_handle = handles[0]
+        target_handle = handles[index]
+        try:
+            deleted_count = subsys.delete_subobject(context_handle, target_handle, bp)
+            result["deleted_count"] = int(deleted_count) if deleted_count else 0
+        except TypeError:
+            # 兜底：无 bp_context
+            deleted_count = subsys.delete_subobject(context_handle, target_handle)
+            result["deleted_count"] = int(deleted_count) if deleted_count else 0
+        unreal.EditorAssetLibrary.save_loaded_asset(bp, only_if_is_dirty=False)
+        handles_after = subsys.k2_gather_subobject_data_for_blueprint(bp) or []
+        result["count_after"] = len(handles_after)
+        result["deleted_index"] = index
+        result["ok"] = result["count_after"] < result["count_before"]
+        if not result["ok"]:
+            result["error"] = f"count 未减：{result['count_before']} → {result['count_after']}"
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+def rename_asset(old_path, new_path):
+    """重命名/移动资产。"""
+    result = {"ok": False, "old_path": old_path, "new_path": new_path, "error": None}
+    try:
+        if not unreal.EditorAssetLibrary.does_asset_exist(old_path):
+            result["error"] = f"源资产不存在：{old_path}"
+            return result
+        if unreal.EditorAssetLibrary.does_asset_exist(new_path):
+            result["error"] = f"目标资产已存在：{new_path}"
+            return result
+        ok = unreal.EditorAssetLibrary.rename_asset(old_path, new_path)
+        result["ok"] = bool(ok)
+        if not ok:
+            result["error"] = "rename_asset 返回 False"
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+def duplicate_asset(source_path, new_path):
+    """复制资产。"""
+    result = {"ok": False, "source": source_path, "new_path": new_path,
+              "created": False, "error": None}
+    try:
+        if not unreal.EditorAssetLibrary.does_asset_exist(source_path):
+            result["error"] = f"源资产不存在：{source_path}"
+            return result
+        if unreal.EditorAssetLibrary.does_asset_exist(new_path):
+            result["error"] = f"目标资产已存在：{new_path}"
+            return result
+        obj = unreal.EditorAssetLibrary.duplicate_asset(source_path, new_path)
+        if obj is None:
+            result["error"] = "duplicate_asset 返回 None"
+            return result
+        unreal.EditorAssetLibrary.save_loaded_asset(obj, only_if_is_dirty=False)
+        result["ok"] = True
+        result["created"] = True
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+def delete_asset(asset_path):
+    """删除资产。"""
+    result = {"ok": False, "path": asset_path, "was_existed": False, "error": None}
+    try:
+        result["was_existed"] = unreal.EditorAssetLibrary.does_asset_exist(asset_path)
+        if not result["was_existed"]:
+            result["ok"] = True
+            return result
+        ok = unreal.EditorAssetLibrary.delete_asset(asset_path)
+        result["ok"] = bool(ok) and not unreal.EditorAssetLibrary.does_asset_exist(asset_path)
+        if not result["ok"]:
+            result["error"] = "delete_asset 返回 False 或资产仍存在"
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
